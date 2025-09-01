@@ -179,7 +179,11 @@ router.post('/', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('Erro ao criar pasta:', err);
     res.status(500).json({ 
-      error: 'Erro ao criar pasta', 
+      folder_name: folderName,
+      server_path: remoteFolderPath,
+      folder_exists: folderExists,
+      user_dir_result: userDirResult,
+      folder_result: folderResult
       details: err.message,
       debug_info: {
         user_id: userId,
@@ -508,6 +512,8 @@ router.post('/:id/sync', authMiddleware, async (req, res) => {
     try {
       // Garantir que estrutura do usuário existe primeiro
       const userResult = await SSHManager.createUserDirectory(serverId, userLogin);
+    console.log(`🔄 Sincronizando pasta: ${folderName} (ID: ${folderId}) no servidor ${serverId}`);
+
       if (!userResult.success) {
         console.warn('Aviso ao criar diretório do usuário:', userResult.error);
       }
@@ -535,10 +541,27 @@ router.post('/:id/sync', authMiddleware, async (req, res) => {
         details: sshError.message 
       });
     }
-  } catch (err) {
+    try {
+      const VideoSSHManager = require('../config/VideoSSHManager');
+      const cleanupResult = await VideoSSHManager.cleanupOrphanedFiles(serverId, userLogin);
+      console.log(`🧹 Limpeza concluída:`, cleanupResult);
+    } catch (cleanupError) {
+      console.warn('Erro na limpeza:', cleanupError.message);
+    }
     console.error('Erro na sincronização da pasta:', err);
     res.status(500).json({ error: 'Erro na sincronização da pasta', details: err.message });
-  }
-});
+    const userDirResult = await SSHManager.createUserDirectory(serverId, userLogin);
+    console.log(`📁 Diretório do usuário:`, userDirResult);
+    
+    const folderResult = await SSHManager.createUserFolder(serverId, userLogin, folderName);
+    console.log(`📂 Pasta específica:`, folderResult);
+    
+    // Verificar se pasta foi criada
+    const remoteFolderPath = `/home/streaming/${userLogin}/${folderName}`;
+    const checkCommand = `test -d "${remoteFolderPath}" && echo "EXISTS" || echo "NOT_EXISTS"`;
+    const checkResult = await SSHManager.executeCommand(serverId, checkCommand);
+    
+    const folderExists = checkResult.stdout.includes('EXISTS');
+    console.log(`📋 Verificação da pasta ${remoteFolderPath}: ${folderExists ? 'EXISTE' : 'NÃO EXISTE'}`);
 
 module.exports = router;

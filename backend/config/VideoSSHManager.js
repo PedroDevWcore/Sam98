@@ -56,17 +56,42 @@ class VideoSSHManager {
             const basePath = `/home/streaming/${userLogin}`;
             const searchPath = folderName ? `${basePath}/${folderName}` : basePath;
             
+            console.log(`🔍 Procurando vídeos em: ${searchPath}`);
+            
+            // Verificar se o diretório existe primeiro
+            const checkDirCommand = `test -d "${searchPath}" && echo "DIR_EXISTS" || echo "DIR_NOT_EXISTS"`;
+            const checkResult = await SSHManager.executeCommand(serverId, checkDirCommand);
+            
+            if (checkResult.stdout.includes('DIR_NOT_EXISTS')) {
+                console.log(`📁 Diretório ${searchPath} não existe, criando...`);
+                
+                // Criar estrutura completa
+                const SSHManager = require('./SSHManager');
+                await SSHManager.createUserDirectory(serverId, userLogin);
+                
+                if (folderName) {
+                    await SSHManager.createUserFolder(serverId, userLogin, folderName);
+                }
+                
+                // Aguardar criação
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+            
             // Comando para listar apenas arquivos de vídeo recursivamente
-            const command = `find "${searchPath}" -type f \\( -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" -o -iname "*.mkv" \\) -exec ls -la {} \\; 2>/dev/null || echo "NO_VIDEOS"`;
+            const command = `find "${searchPath}" -type f \\( -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" -o -iname "*.mkv" -o -iname "*.3gp" -o -iname "*.ts" -o -iname "*.mpg" -o -iname "*.mpeg" -o -iname "*.ogv" -o -iname "*.m4v" \\) -exec ls -la {} \\; 2>/dev/null || echo "NO_VIDEOS"`;
             
             const result = await SSHManager.executeCommand(serverId, command);
             
+            console.log(`📋 Resultado do comando find (primeiros 500 chars): ${result.stdout.substring(0, 500)}`);
+            
             if (result.stdout.includes('NO_VIDEOS')) {
+                console.log(`📂 Nenhum vídeo encontrado em ${searchPath}`);
                 return [];
             }
 
             const videos = [];
             const lines = result.stdout.split('\n').filter(line => line.trim());
+            console.log(`📄 Total de linhas processadas: ${lines.length}`);
             
             for (const line of lines) {
                 if (line.includes('total ') || !line.trim()) continue;
@@ -81,6 +106,8 @@ class VideoSSHManager {
                 const relativePath = fullPath.replace(`/home/streaming/`, '');
                 const folderPath = path.dirname(relativePath);
                 const fileExtension = path.extname(fileName).toLowerCase();
+                
+                console.log(`📹 Vídeo encontrado: ${fileName} (${size} bytes) em ${fullPath}`);
                 
                 // Extrair duração e bitrate do vídeo via ffprobe
                 let duration = 0;
@@ -110,7 +137,7 @@ class VideoSSHManager {
                         }
                     }
                 } catch (error) {
-                    console.warn(`Não foi possível obter informações de ${fileName}`);
+                    console.warn(`⚠️ Não foi possível obter informações de ${fileName}:`, error.message);
                 }
 
                 // Verificar se é MP4 e se bitrate está dentro do limite
@@ -148,7 +175,7 @@ class VideoSSHManager {
                 });
             }
 
-            console.log(`📹 Encontrados ${videos.length} vídeos no servidor para ${userLogin}`);
+            console.log(`📹 Total de vídeos processados: ${videos.length} para usuário ${userLogin} na pasta ${folderName || 'todas'}`);
             
             // Sincronizar com banco de dados
             await this.syncVideosWithDatabase(videos, userLogin, serverId);
@@ -178,11 +205,16 @@ class VideoSSHManager {
                     if (existingRows.length === 0) {
                         // Buscar código do cliente baseado no userLogin
                         const [clienteRows] = await db.execute(
-                            'SELECT codigo_cliente FROM streamings WHERE usuario = ? OR email LIKE ? LIMIT 1',
+                            'SELECT codigo_cliente, codigo FROM streamings WHERE usuario = ? OR email LIKE ? LIMIT 1',
                             [userLogin, `${userLogin}@%`]
                         );
                         
                         const codigoCliente = clienteRows.length > 0 ? clienteRows[0].codigo_cliente : null;
+                        
+                        if (!codigoCliente) {
+                            console.warn(`⚠️ Cliente não encontrado para userLogin: ${userLogin}`);
+                            continue;
+                        }
                         
                         // Buscar ID da pasta baseado no nome
                         const [pastaRows] = await db.execute(
@@ -191,6 +223,11 @@ class VideoSSHManager {
                         );
                         
                         const pastaId = pastaRows.length > 0 ? pastaRows[0].id : null;
+                        
+                        if (!pastaId) {
+                            console.warn(`⚠️ Pasta não encontrada para: ${video.folder} (user: ${codigoCliente})`);
+                            continue;
+                        }
                         
                         // Inserir novo vídeo na tabela videos
                         const duracao = this.formatDuration(video.duration);
@@ -216,7 +253,7 @@ class VideoSSHManager {
                           compatibilityStatus = 'otimizado';
                         }
                         
-                        await db.execute(
+                        const [insertResult] = await db.execute(
                             `INSERT INTO videos (
                                 nome, url, caminho, duracao, tamanho_arquivo,
                                 codigo_cliente, pasta, bitrate_video, formato_original,
@@ -238,13 +275,14 @@ class VideoSSHManager {
                             ]
                         );
                         
-                        console.log(`✅ Vídeo sincronizado no banco: ${video.nome}`);
+                        console.log(`✅ Vídeo inserido no banco: ${video.nome} (ID: ${insertResult.insertId})`);
                     } else {
                         // Atualizar informações se necessário
                         await db.execute(
                             'UPDATE videos SET tamanho_arquivo = ?, duracao = ?, codec_video = ?, formato_original = ? WHERE caminho = ?',
                             [video.size, video.duration, video.formato_original || 'unknown', video.formato_original || 'unknown', video.fullPath]
                         );
+                        console.log(`🔄 Vídeo atualizado no banco: ${video.nome}`);
                     }
                 } catch (videoError) {
                     console.warn(`Erro ao sincronizar vídeo ${video.nome}:`, videoError.message);

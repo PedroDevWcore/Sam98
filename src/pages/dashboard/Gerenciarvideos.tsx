@@ -123,16 +123,57 @@ const GerenciarVideos: React.FC = () => {
     try {
       const token = await getToken();
       
-      // Carregar vídeos diretamente (sem sincronização automática)
+      // PRIMEIRO: Sincronizar com servidor para garantir dados atualizados
+      console.log(`🔄 Sincronizando pasta ${selectedFolder} com servidor...`);
+      
+      try {
+        const syncResponse = await fetch(`/api/videos-ssh/sync-database`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify({ folderId: selectedFolder })
+        });
+        
+        if (syncResponse.ok) {
+          const syncData = await syncResponse.json();
+          console.log(`✅ Sincronização concluída:`, syncData);
+          
+          if (syncData.success) {
+            toast.success(`Sincronização: ${syncData.videos_count} vídeos encontrados`);
+          }
+        } else {
+          console.warn('Erro na sincronização, continuando com dados do banco...');
+        }
+      } catch (syncError) {
+        console.warn('Erro na sincronização:', syncError);
+        toast.warning('Erro na sincronização, mostrando dados do banco');
+      }
+      
+      // SEGUNDO: Carregar vídeos do banco (agora sincronizados)
       const response = await fetch(`/api/videos?folder_id=${selectedFolder}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       const data = await response.json();
-      setVideos(Array.isArray(data) ? data : []);
+      
+      if (Array.isArray(data)) {
+        setVideos(data);
+        console.log(`📊 Carregados ${data.length} vídeos do banco para exibição`);
+        
+        if (data.length === 0) {
+          toast.info('Nenhum vídeo encontrado nesta pasta. Verifique se os arquivos estão no servidor.');
+        }
+      } else {
+        console.error('Resposta inválida da API:', data);
+        setVideos([]);
+        toast.error('Erro ao carregar vídeos: resposta inválida');
+      }
 
     } catch (error) {
       console.error('Erro ao carregar vídeos:', error);
       toast.error('Erro ao carregar vídeos');
+      setVideos([]);
     } finally {
       setLoading(false);
     }
@@ -243,8 +284,10 @@ const GerenciarVideos: React.FC = () => {
     try {
       const token = await getToken();
       
+      console.log(`🔄 Iniciando sincronização completa da pasta ${folderId}...`);
+      
       // Primeiro sincronizar com banco de dados
-      await fetch(`/api/videos-ssh/sync-database`, {
+      const syncResponse = await fetch(`/api/videos-ssh/sync-database`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -252,6 +295,17 @@ const GerenciarVideos: React.FC = () => {
         },
         body: JSON.stringify({ folderId })
       });
+      
+      if (syncResponse.ok) {
+        const syncData = await syncResponse.json();
+        console.log('📊 Resultado da sincronização:', syncData);
+        
+        if (syncData.success) {
+          toast.success(`Sincronização: ${syncData.videos_count} vídeos no banco, ${syncData.server_videos_count} no servidor`);
+        } else {
+          toast.warning('Sincronização parcial: ' + syncData.message);
+        }
+      }
       
       // Depois sincronizar pasta no servidor
       const response = await fetch(`/api/folders/${folderId}/sync`, {
@@ -263,7 +317,9 @@ const GerenciarVideos: React.FC = () => {
       });
 
       if (response.ok) {
-        toast.success('Pasta sincronizada com servidor!');
+        const folderSyncData = await response.json();
+        console.log('📁 Resultado da sincronização da pasta:', folderSyncData);
+        
         loadFolderInfo(folderId);
         loadVideos(); // Recarregar vídeos após sincronização
       } else {
@@ -714,7 +770,21 @@ const GerenciarVideos: React.FC = () => {
             <div className="text-center py-12 text-gray-500">
               <Video className="h-16 w-16 mx-auto mb-4 text-gray-300" />
               <p className="text-lg mb-2">Nenhum vídeo encontrado</p>
-              <p className="text-sm">Faça upload de vídeos para começar</p>
+              <p className="text-sm mb-4">Faça upload de vídeos ou sincronize com o servidor</p>
+              {selectedFolder && (
+                <div className="space-y-2">
+                  <button
+                    onClick={() => syncFolder(selectedFolder)}
+                    className="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 flex items-center mx-auto"
+                  >
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    Sincronizar com Servidor
+                  </button>
+                  <p className="text-xs text-gray-500">
+                    Clique para verificar se há vídeos no servidor que não estão aparecendo
+                  </p>
+                </div>
+              )}
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -885,6 +955,36 @@ const GerenciarVideos: React.FC = () => {
                   </div>
                 </div>
               )}
+              
+              {/* Botão de debug para forçar sincronização */}
+              <div className="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-md">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-blue-800 text-sm font-medium">🔧 Ferramentas de Debug</p>
+                    <p className="text-blue-700 text-xs">Use se os vídeos não estão aparecendo corretamente</p>
+                  </div>
+                  <div className="flex space-x-2">
+                    <button
+                      onClick={() => {
+                        console.log('🔄 Forçando sincronização completa...');
+                        syncFolder(selectedFolder);
+                      }}
+                      className="bg-blue-600 text-white px-3 py-1 rounded text-xs hover:bg-blue-700"
+                    >
+                      Forçar Sincronização
+                    </button>
+                    <button
+                      onClick={() => {
+                        console.log('🔄 Recarregando vídeos...');
+                        loadVideos();
+                      }}
+                      className="bg-green-600 text-white px-3 py-1 rounded text-xs hover:bg-green-700"
+                    >
+                      Recarregar Lista
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
           )}
         </div>

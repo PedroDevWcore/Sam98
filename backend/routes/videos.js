@@ -156,22 +156,36 @@ router.get('/', authMiddleware, async (req, res) => {
     const userId = req.user.id;
     const userLogin = req.user.email ? req.user.email.split('@')[0] : `user_${userId}`;
     const folderId = req.query.folder_id;
+    
     if (!folderId) {
       return res.status(400).json({ error: 'folder_id é obrigatório' });
     }
 
-    // Buscar dados da pasta
+    // Buscar dados da pasta na nova tabela folders
     const [folderRows] = await db.execute(
-      'SELECT identificacao, codigo_servidor, espaco_usado FROM streamings WHERE codigo = ? AND codigo_cliente = ?',
+      'SELECT nome_sanitizado, servidor_id, espaco_usado FROM folders WHERE id = ? AND user_id = ?',
       [folderId, userId]
     );
+    
     if (folderRows.length === 0) {
       return res.status(404).json({ error: 'Pasta não encontrada' });
     }
-
+    
     const folderData = folderRows[0];
-    const folderName = folderRows[0].identificacao;
-    const serverId = folderData.codigo_servidor || 1;
+    const folderName = folderData.nome_sanitizado;
+    const serverId = folderData.servidor_id || 1;
+    
+    console.log(`📁 Buscando vídeos na pasta: ${folderName} (ID: ${folderId}) para usuário: ${userLogin}`);
+    
+    // PRIMEIRO: Sincronizar com servidor para garantir que temos os dados mais recentes
+    try {
+      const VideoSSHManager = require('../config/VideoSSHManager');
+      const videosFromServer = await VideoSSHManager.listVideosFromServer(serverId, userLogin, folderName);
+      console.log(`📊 Encontrados ${videosFromServer.length} vídeos no servidor`);
+    } catch (syncError) {
+      console.warn('Erro na sincronização com servidor:', syncError.message);
+    }
+    
     // Buscar vídeos na tabela videos usando pasta
     const [rows] = await db.execute(
       `SELECT 
@@ -191,13 +205,59 @@ router.get('/', authMiddleware, async (req, res) => {
        FROM videos 
        WHERE (codigo_cliente = ? OR codigo_cliente IN (
          SELECT codigo_cliente FROM streamings WHERE codigo = ?
-       )) AND pasta = ?
+       )) AND pasta = ? AND nome IS NOT NULL AND nome != ''
        ORDER BY id DESC`,
       [userId, userId, folderId]
     );
 
-    console.log(`📁 Buscando vídeos na pasta: ${folderName} (ID: ${folderId})`);
     console.log(`📊 Encontrados ${rows.length} vídeos no banco`);
+    
+    // Se não encontrou vídeos no banco, tentar sincronizar novamente
+    if (rows.length === 0) {
+      console.log(`⚠️ Nenhum vídeo encontrado no banco para pasta ${folderName}, tentando sincronização completa...`);
+      
+      try {
+        // Garantir que estrutura do usuário existe
+        const SSHManager = require('../config/SSHManager');
+        await SSHManager.createCompleteUserStructure(serverId, userLogin, {
+          bitrate: req.user.bitrate || 2500,
+          espectadores: req.user.espectadores || 100,
+          status_gravando: 'nao'
+        });
+        
+        // Criar pasta se não existir
+        await SSHManager.createUserFolder(serverId, userLogin, folderName);
+        
+        // Listar vídeos do servidor e sincronizar
+        const VideoSSHManager = require('../config/VideoSSHManager');
+        const videosFromServer = await VideoSSHManager.listVideosFromServer(serverId, userLogin, folderName);
+        
+        if (videosFromServer.length > 0) {
+          console.log(`✅ Sincronização encontrou ${videosFromServer.length} vídeos no servidor`);
+          
+          // Buscar novamente após sincronização
+          const [newRows] = await db.execute(
+            `SELECT 
+              id, nome, url, caminho, duracao, tamanho_arquivo as tamanho,
+              bitrate_video, formato_original, codec_video, is_mp4, compativel, largura, altura
+             FROM videos 
+             WHERE codigo_cliente = ? AND pasta = ? AND nome IS NOT NULL AND nome != ''
+             ORDER BY id DESC`,
+            [userId, folderId]
+          );
+          
+          if (newRows.length > 0) {
+            console.log(`✅ Após sincronização: ${newRows.length} vídeos encontrados no banco`);
+            // Usar os novos dados
+            rows.splice(0, rows.length, ...newRows);
+          }
+        } else {
+          console.log(`📂 Pasta ${folderName} existe no servidor mas está vazia`);
+        }
+      } catch (syncError) {
+        console.error('Erro na sincronização completa:', syncError.message);
+      }
+    }
 
     // Sincronizar com servidor e atualizar informações
     const VideoSSHManager = require('../config/VideoSSHManager');
@@ -803,9 +863,9 @@ router.get('/content/*', authMiddleware, async (req, res) => {
         const serverId = userServerRows[0].codigo_servidor;
         
         // Buscar dados do servidor
-        const [serverRows] = await db.execute(
-          'SELECT ip, dominio, senha_root FROM wowza_servers WHERE codigo = ? AND status = "ativo"',
-          [serverId]
+        await db.execute(
+          'UPDATE folders SET espaco_usado = ? WHERE id = ?',
+          [totalSizeUpdated, folderId]
         );
         
         if (serverRows.length > 0) {

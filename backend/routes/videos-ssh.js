@@ -646,7 +646,7 @@ router.post('/sync-database', authMiddleware, async (req, res) => {
       });
     }
 
-    // Buscar dados da pasta
+    // Buscar dados da pasta na nova tabela folders
     const [folderRows] = await db.execute(
       'SELECT nome_sanitizado, servidor_id FROM folders WHERE id = ? AND user_id = ?',
       [folderId, userId]
@@ -663,6 +663,8 @@ router.post('/sync-database', authMiddleware, async (req, res) => {
     const serverId = folder.servidor_id || 1;
     const folderName = folder.nome_sanitizado;
 
+    console.log(`🔄 Sincronizando pasta: ${folderName} (ID: ${folderId}) para usuário: ${userLogin}`);
+
     // Garantir que estrutura existe no servidor
     await SSHManager.createCompleteUserStructure(serverId, userLogin, {
       bitrate: req.user.bitrate || 2500,
@@ -672,15 +674,21 @@ router.post('/sync-database', authMiddleware, async (req, res) => {
     
     await SSHManager.createUserFolder(serverId, userLogin, folderName);
     
+    // Aguardar criação da estrutura
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
     // Listar vídeos do servidor na nova estrutura
     const remoteFolderPath = `/home/streaming/${userLogin}/${folderName}`;
-    const listCommand = `find "${remoteFolderPath}" -type f \\( -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" -o -iname "*.mkv" \\) -exec ls -la {} \\; 2>/dev/null || echo "NO_VIDEOS"`;
+    const listCommand = `find "${remoteFolderPath}" -type f \\( -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" -o -iname "*.mkv" -o -iname "*.3gp" -o -iname "*.ts" -o -iname "*.mpg" -o -iname "*.mpeg" -o -iname "*.ogv" -o -iname "*.m4v" \\) -exec ls -la {} \\; 2>/dev/null || echo "NO_VIDEOS"`;
     
     const result = await SSHManager.executeCommand(serverId, listCommand);
+    
+    console.log(`📋 Resultado do comando find: ${result.stdout.substring(0, 200)}...`);
     
     let videos = [];
     if (!result.stdout.includes('NO_VIDEOS')) {
       const lines = result.stdout.split('\n').filter(line => line.trim());
+      console.log(`📄 Linhas encontradas: ${lines.length}`);
       
       for (const line of lines) {
         if (line.includes('total ') || !line.trim()) continue;
@@ -692,6 +700,8 @@ router.post('/sync-database', authMiddleware, async (req, res) => {
         const fullPath = parts.slice(8).join(' ');
         const fileName = path.basename(fullPath);
         const relativePath = fullPath.replace('/home/streaming/', '');
+        
+        console.log(`📹 Processando vídeo: ${fileName} (${size} bytes)`);
         
         // Obter informações do vídeo via ffprobe
         let duration = 0;
@@ -732,21 +742,53 @@ router.post('/sync-database', authMiddleware, async (req, res) => {
           is_mp4: path.extname(fileName).toLowerCase() === '.mp4'
         });
       }
+    } else {
+      console.log(`📂 Nenhum vídeo encontrado no servidor para pasta ${folderName}`);
+      
+      // Verificar se a pasta existe no servidor
+      const checkDirCommand = `test -d "${remoteFolderPath}" && echo "DIR_EXISTS" || echo "DIR_NOT_EXISTS"`;
+      const checkResult = await SSHManager.executeCommand(serverId, checkDirCommand);
+      
+      if (checkResult.stdout.includes('DIR_NOT_EXISTS')) {
+        console.log(`📁 Pasta ${remoteFolderPath} não existe, criando...`);
+        await SSHManager.createUserFolder(serverId, userLogin, folderName);
+      }
     }
 
-    // Limpar vídeos antigos desta pasta do banco
-    await db.execute(
-      'DELETE FROM videos WHERE pasta = ? AND codigo_cliente = ?',
+    console.log(`🔄 Sincronizando ${videos.length} vídeos com banco de dados...`);
+    
+    // Não limpar todos os vídeos - apenas sincronizar os que existem
+    // Buscar vídeos existentes no banco para esta pasta
+    const [existingVideos] = await db.execute(
+      'SELECT id, nome, caminho FROM videos WHERE pasta = ? AND codigo_cliente = ?',
       [folderId, userId]
     );
+    
+    const existingPaths = new Set(existingVideos.map(v => v.caminho));
+    const serverPaths = new Set(videos.map(v => v.fullPath));
+    
+    // Remover vídeos que não existem mais no servidor
+    for (const existingVideo of existingVideos) {
+      if (!serverPaths.has(existingVideo.caminho)) {
+        console.log(`🗑️ Removendo vídeo que não existe mais no servidor: ${existingVideo.nome}`);
+        await db.execute('DELETE FROM videos WHERE id = ?', [existingVideo.id]);
+      }
+    }
 
     // Inserir vídeos atualizados na tabela videos
     let totalSize = 0;
     for (const video of videos) {
+      // Verificar se vídeo já existe no banco
+      if (existingPaths.has(video.fullPath)) {
+        console.log(`⏭️ Vídeo já existe no banco: ${video.nome}`);
+        totalSize += Math.ceil(video.size / (1024 * 1024));
+        continue;
+      }
+      
       try {
         const relativePath = video.relativePath;
         
-        await db.execute(
+        const [insertResult] = await db.execute(
           `INSERT INTO videos (
             nome, url, caminho, duracao, tamanho_arquivo,
             codigo_cliente, pasta, bitrate_video, formato_original,
@@ -766,6 +808,7 @@ router.post('/sync-database', authMiddleware, async (req, res) => {
           ]
         );
         
+        console.log(`✅ Vídeo inserido no banco: ${video.nome} (ID: ${insertResult.insertId})`);
         totalSize += video.size;
       } catch (videoError) {
         console.warn(`Erro ao inserir vídeo ${video.nome}:`, videoError.message);
@@ -774,18 +817,34 @@ router.post('/sync-database', authMiddleware, async (req, res) => {
 
     // Atualizar espaço usado da pasta
     const totalMB = Math.ceil(totalSize / (1024 * 1024));
-    await db.execute(
-      'UPDATE streamings SET espaco_usado = ? WHERE codigo = ?',
-      [totalMB, folderId]
-    );
+    if (totalMB > 0) {
+      await db.execute(
+        'UPDATE folders SET espaco_usado = ? WHERE id = ?',
+        [totalMB, folderId]
+      );
+    }
 
-    console.log(`🔄 Sincronização concluída: ${videos.length} vídeos, ${totalMB}MB`);
+    console.log(`🔄 Sincronização concluída: ${videos.length} vídeos encontrados no servidor, ${totalMB}MB`);
+    
+    // Buscar vídeos atualizados do banco para retornar
+    const [finalRows] = await db.execute(
+      `SELECT 
+        id, nome, url, caminho, duracao, tamanho_arquivo as tamanho,
+        bitrate_video, formato_original, codec_video, is_mp4, compativel, largura, altura
+       FROM videos 
+       WHERE codigo_cliente = ? AND pasta = ? AND nome IS NOT NULL AND nome != ''
+       ORDER BY id DESC`,
+      [userId, folderId]
+    );
 
     res.json({
       success: true,
-      message: `Sincronização concluída: ${videos.length} vídeos processados`,
-      videos_count: videos.length,
-      total_size_mb: totalMB
+      message: `Sincronização concluída: ${videos.length} vídeos encontrados no servidor, ${finalRows.length} vídeos no banco`,
+      videos_count: finalRows.length,
+      server_videos_count: videos.length,
+      total_size_mb: totalMB,
+      folder_name: folderName,
+      server_path: remoteFolderPath
     });
   } catch (error) {
     console.error('Erro na sincronização:', error);
